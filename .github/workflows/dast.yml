@@ -1,0 +1,83 @@
+name: Dast scan
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  zap-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    services:
+      db:
+        image: mariadb:10
+        env:
+          MYSQL_ROOT_PASSWORD: dvwa
+          MYSQL_DATABASE: dvwa
+          MYSQL_USER: dvwa
+          MYSQL_USER_PASSWORD: p@ssword
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+
+      dvwa:
+        image: ghcr.io/digininja/dvwa:latest
+        env:
+          DB_SERVER: db
+        ##ports: -80:80
+
+    env:
+      TARGET: http://localhost
+      SECURITY_LEVEL: low
+      MAX_HIGH: 0
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install Python packages
+        run: pip install zaproxy requests
+
+      - name: Generate a one-time ZAP API key
+        run: |
+          KEY=$(openssl rand -hex 16)
+          echo "::add-mask::$KEY"
+          echo "ZAP_API_KEY=$KEY" >> $GITHUB_ENV
+
+      - name: Start ZAP in daemon mode
+        run: |
+          docker run -d --name zap --network host \
+          ghcr.io/zaproxy/zaproxy:stable \
+          zap.sh -daemon -host 127.0.0.1 -port 8080 \
+          -config api.key="$ZAP_API_KEY"
+
+          for i in $(seq 1 60); do
+              curl -sh "http://127.0.0.1:8080/JSON/core/view/version/?apikey=$ZAP_API_KEY" && break ||
+              sleep 5
+          done
+
+      - name: Initialize DVWA database
+        run: python ci/setup_dvwa.py
+
+      - name: Run ZAP scan and quality gate
+        run: python ci/zap_scan.py
+
+      - name: Upload scan reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: zap-reports
+          path: |
+            zap-report.html
+            zap-alerts.json
+
+      - name: Show ZAP log on failure
+        if: failure()
+        run: docker logs zap | tail -n 50
